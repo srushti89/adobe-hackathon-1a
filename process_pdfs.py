@@ -1,108 +1,103 @@
-import fitz  # PyMuPDF
-import json
 import os
-import sys
+import json
+import fitz  # PyMuPDF
+from pathlib import Path
 
-def extract_text_details_from_pdf(pdf_path):
-    doc = fitz.open(pdf_path)
-    pages = []
+def extract_title(doc):
+    """Extracts a title from the first page based on font size and position."""
+    page = doc[0]
+    blocks = page.get_text("dict")["blocks"]
+    text_elements = []
 
-    for page_num in range(len(doc)):
-        page = doc[page_num]
-        blocks = page.get_text("dict")["blocks"]
-
-        for block in blocks:
-            if block["type"] != 0:
-                continue
-            for line in block["lines"]:
-                for span in line["spans"]:
-                    text = span["text"].strip()
-                    font_size = span["size"]
-                    font = span["font"].lower()
-
-                    if not text:
-                        continue
-
-                    # Simple heuristic to detect title and headings
-                    pages.append({
-                        "text": text,
-                        "font_size": font_size,
-                        "font_name": font,
-                        "page": page_num  # 0-indexed
-                    })
-
-    doc.close()
-    return pages
-
-def classify_headings(blocks):
-    # Get the largest font size to assume it's the title
-    if not blocks:
-        return None, []
-
-    # Sort by font size descending
-    sorted_blocks = sorted(blocks, key=lambda b: -b["font_size"])
-    title = sorted_blocks[0]["text"]
-
-    # Decide thresholds for H1, H2, H3 based on top few font sizes
-    font_sizes = sorted(set(b["font_size"] for b in blocks), reverse=True)
-    h1, h2, h3 = (font_sizes + [0, 0, 0])[:3]
-
-    outline = []
     for block in blocks:
-        level = None
-        if block["font_size"] == h1:
-            level = "H1"
-        elif block["font_size"] == h2:
-            level = "H2"
-        elif block["font_size"] == h3:
-            level = "H3"
+        for line in block.get("lines", []):
+            for span in line.get("spans", []):
+                text_elements.append(span)
 
-        if level:
-            outline.append({
-                "level": level,
-                "text": block["text"],
-                "page": block["page"]
-            })
+    if not text_elements:
+        return "Untitled Document"
 
-    return title, outline
+    # Sort by font size (desc) then by y (asc)
+    text_elements.sort(key=lambda x: (-x["size"], x["bbox"][1]))
+    title = text_elements[0]["text"].strip()
+    return title
 
-def save_to_json(data, output_path):
-    with open(output_path, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=4, ensure_ascii=False)
+def classify_heading(font_size, font_size_thresholds):
+    """Classify heading levels by font size."""
+    if font_size >= font_size_thresholds["H1"]:
+        return "H1"
+    elif font_size >= font_size_thresholds["H2"]:
+        return "H2"
+    else:
+        return "H3"
 
-def main():
-    input_dir = "input"
-    output_dir = "output"
+def process_pdfs():
+    # Try default Docker paths
+    input_dir = Path("/app/input")
+    output_dir = Path("/app/output")
 
-    if not os.path.exists(input_dir):
-        print(f"❌ Input directory not found: {input_dir}", file=sys.stderr)
-        sys.exit(1)
+    # ✅ Fall back to local folders if running outside Docker
+    if not input_dir.exists():
+        input_dir = Path("input")
+        output_dir = Path("output")
 
-    os.makedirs(output_dir, exist_ok=True)
+    # Ensure output folder exists
+    output_dir.mkdir(parents=True, exist_ok=True)
 
-    processed = False
-    for filename in os.listdir(input_dir):
-        if filename.lower().endswith(".pdf"):
-            pdf_path = os.path.join(input_dir, filename)
-            output_path = os.path.join(output_dir, filename.replace(".pdf", ".json"))
+    # Process each PDF in input_dir
+    for pdf_file in input_dir.glob("*.pdf"):
+        print(f"🔍 Processing: {pdf_file.name}")
+        doc = fitz.open(pdf_file)
 
-            try:
-                print(f"🔍 Processing: {filename}")
-                blocks = extract_text_details_from_pdf(pdf_path)
-                title, outline = classify_headings(blocks)
-                result = {
-                    "title": title,
-                    "outline": outline
-                }
-                save_to_json(result, output_path)
-                print(f"✅ Processed: {filename} → {output_path}")
-                processed = True
-            except Exception as e:
-                print(f"❌ Failed: {filename} | Error: {e}", file=sys.stderr)
+        title = extract_title(doc)
 
-    if not processed:
-        print("⚠️ No PDF files processed", file=sys.stderr)
-        sys.exit(1)
+        font_sizes = []
+        outlines = []
+
+        # Gather font sizes to determine thresholds
+        for page_num, page in enumerate(doc):
+            blocks = page.get_text("dict")["blocks"]
+            for block in blocks:
+                for line in block.get("lines", []):
+                    for span in line.get("spans", []):
+                        font_sizes.append(span["size"])
+
+        # Get font size thresholds (top 3 unique sizes)
+        unique_sizes = sorted(set(font_sizes), reverse=True)
+        font_size_thresholds = {
+            "H1": unique_sizes[0] if len(unique_sizes) > 0 else 12,
+            "H2": unique_sizes[1] if len(unique_sizes) > 1 else 11,
+        }
+
+        # Extract outline
+        for page_num, page in enumerate(doc):
+            blocks = page.get_text("dict")["blocks"]
+            for block in blocks:
+                for line in block.get("lines", []):
+                    for span in line.get("spans", []):
+                        text = span["text"].strip()
+                        if not text or len(text) < 3:
+                            continue
+                        heading_level = classify_heading(span["size"], font_size_thresholds)
+                        outlines.append({
+                            "level": heading_level,
+                            "text": text,
+                            "page": page_num
+                        })
+
+        # Save output
+        output_data = {
+            "title": title,
+            "outline": outlines
+        }
+
+        output_file = output_dir / f"{pdf_file.stem}.json"
+        with open(output_file, "w", encoding="utf-8") as f:
+            json.dump(output_data, f, indent=2, ensure_ascii=False)
+
+        print(f"✅ Processed: {pdf_file.name} → {output_file.name}")
 
 if __name__ == "__main__":
-    main()
+    print("🚀 Starting PDF processing...")
+    process_pdfs()
+    print("✅ All PDFs processed.")
