@@ -1,103 +1,150 @@
 import os
-import json
 import fitz  # PyMuPDF
-from pathlib import Path
+import json
+import unicodedata
+
+INPUT_DIR = "input"
+OUTPUT_DIR = "output"
+LEVELS = ["H1", "H2", "H3"]  # Only include up to H3
+
+def is_probable_table_block(block):
+    lines = block.get("lines", [])
+    if len(lines) > 4:
+        avg_len = sum(len(" ".join(span["text"] for span in line.get("spans", []))) for line in lines) / len(lines)
+        if avg_len < 40:
+            return True
+    return False
+
+def map_font_sizes_to_levels(font_sizes):
+    sorted_fonts = sorted(font_sizes.items(), key=lambda x: (-x[0], -x[1]))
+    try:
+        body_threshold = max(size for size, count in font_sizes.items() if count > 30)
+    except ValueError:
+        body_threshold = min(font_sizes.keys())
+    heading_fonts = [fs for fs, _ in sorted_fonts if fs > body_threshold]
+    size_to_level = {}
+    for i, fs in enumerate(heading_fonts[:3]):  # Only map top 3 heading sizes
+        size_to_level[fs] = LEVELS[i]
+
+    return size_to_level
 
 def extract_title(doc):
-    """Extracts a title from the first page based on font size and position."""
-    page = doc[0]
+    font_counter = {}
+    page = doc.load_page(0)
     blocks = page.get_text("dict")["blocks"]
-    text_elements = []
+    for block in blocks:
+        if "lines" not in block:
+            continue
+        for line in block["lines"]:
+            for span in line.get("spans", []):
+                size = round(span["size"], 1)
+                font_counter[size] = font_counter.get(size, 0) + 1
+
+    if not font_counter:
+        return "", set(), {}
+
+    largest_font = max(font_counter.items(), key=lambda x: x[0])[0]
+    title_lines = []
+    title_segments = set()
+    title_sizes = {}
 
     for block in blocks:
-        for line in block.get("lines", []):
-            for span in line.get("spans", []):
-                text_elements.append(span)
+        if "lines" not in block:
+            continue
+        for line in block["lines"]:
+            spans = line.get("spans", [])
+            if not spans:
+                continue
+            if all(round(span["size"], 1) == largest_font for span in spans):
+                text = " ".join(span["text"].strip() for span in spans).strip()
+                if text:
+                    normalized = text.replace(" ", "").lower()
+                    title_segments.add(normalized)
+                    title_lines.append(text)
+                    title_sizes[largest_font] = title_sizes.get(largest_font, 0) + 1
 
-    if not text_elements:
-        return "Untitled Document"
+    title = "  ".join(title_lines).strip()
+    if len(title.split()) < 3:
+        return "", set(), font_counter
+    return title, title_segments, font_counter
 
-    # Sort by font size (desc) then by y (asc)
-    text_elements.sort(key=lambda x: (-x["size"], x["bbox"][1]))
-    title = text_elements[0]["text"].strip()
-    return title
+def extract_outline(doc):
+    num_pages = len(doc)
+    title, title_segments, title_font_sizes = extract_title(doc)
 
-def classify_heading(font_size, font_size_thresholds):
-    """Classify heading levels by font size."""
-    if font_size >= font_size_thresholds["H1"]:
-        return "H1"
-    elif font_size >= font_size_thresholds["H2"]:
-        return "H2"
-    else:
-        return "H3"
+    font_sizes = title_font_sizes.copy()
+    start_page = 0 if num_pages == 1 else 1
 
-def process_pdfs():
-    # Try default Docker paths
-    input_dir = Path("/app/input")
-    output_dir = Path("/app/output")
+    for page_num in range(start_page, num_pages):
+        page = doc.load_page(page_num)
+        blocks = page.get_text("dict")["blocks"]
+        for block in blocks:
+            if "lines" not in block or is_probable_table_block(block):
+                continue
+            for line in block["lines"]:
+                for span in line.get("spans", []):
+                    size = round(span["size"], 1)
+                    font_sizes[size] = font_sizes.get(size, 0) + 1
 
-    # ✅ Fall back to local folders if running outside Docker
-    if not input_dir.exists():
-        input_dir = Path("input")
-        output_dir = Path("output")
+    size_to_level = map_font_sizes_to_levels(font_sizes)
+    seen_headings = set()
+    outline = []
 
-    # Ensure output folder exists
-    output_dir.mkdir(parents=True, exist_ok=True)
+    for page_num in range(start_page, num_pages):
+        page = doc.load_page(page_num)
+        blocks = page.get_text("dict")["blocks"]
+        for block in blocks:
+            if "lines" not in block or is_probable_table_block(block):
+                continue
+            for line in block["lines"]:
+                spans = line.get("spans", [])
+                if not spans:
+                    continue
+                text = " ".join(span["text"].strip() for span in spans).strip()
+                if len(text) < 2:
+                    continue
+                text = unicodedata.normalize("NFKC", text)
+                size = round(max(span["size"] for span in spans), 1)
+                level = size_to_level.get(size)
 
-    # Process each PDF in input_dir
-    for pdf_file in input_dir.glob("*.pdf"):
-        print(f"🔍 Processing: {pdf_file.name}")
-        doc = fitz.open(pdf_file)
+                normalized_text = text.replace(" ", "").lower()
+                if normalized_text in title_segments or normalized_text in seen_headings:
+                    continue
 
-        title = extract_title(doc)
+                if level:
+                    seen_headings.add(normalized_text)
+                    outline.append({
+                        "level": level,
+                        "text": text,
+                        "page": page_num
+                    })
 
-        font_sizes = []
-        outlines = []
+    return outline, title
 
-        # Gather font sizes to determine thresholds
-        for page_num, page in enumerate(doc):
-            blocks = page.get_text("dict")["blocks"]
-            for block in blocks:
-                for line in block.get("lines", []):
-                    for span in line.get("spans", []):
-                        font_sizes.append(span["size"])
+def process_pdf(file_path):
+    doc = fitz.open(file_path)
+    outline, title = extract_outline(doc)
+    return {
+        "title": title,
+        "outline": outline
+    }
 
-        # Get font size thresholds (top 3 unique sizes)
-        unique_sizes = sorted(set(font_sizes), reverse=True)
-        font_size_thresholds = {
-            "H1": unique_sizes[0] if len(unique_sizes) > 0 else 12,
-            "H2": unique_sizes[1] if len(unique_sizes) > 1 else 11,
-        }
+def main():
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    pdfs = [f for f in os.listdir(INPUT_DIR) if f.lower().endswith(".pdf")]
+    if not pdfs:
+        print("⚠️  No PDF files found in", INPUT_DIR)
+        return
 
-        # Extract outline
-        for page_num, page in enumerate(doc):
-            blocks = page.get_text("dict")["blocks"]
-            for block in blocks:
-                for line in block.get("lines", []):
-                    for span in line.get("spans", []):
-                        text = span["text"].strip()
-                        if not text or len(text) < 3:
-                            continue
-                        heading_level = classify_heading(span["size"], font_size_thresholds)
-                        outlines.append({
-                            "level": heading_level,
-                            "text": text,
-                            "page": page_num
-                        })
+    for filename in pdfs:
+        pdf_path = os.path.join(INPUT_DIR, filename)
+        print(f"📄 Processing: {filename}")
+        result = process_pdf(pdf_path)
+        json_path = os.path.join(OUTPUT_DIR, filename.replace(".pdf", ".json"))
+        with open(json_path, "w", encoding="utf-8") as f:
+            json.dump(result, f, indent=2, ensure_ascii=False)
 
-        # Save output
-        output_data = {
-            "title": title,
-            "outline": outlines
-        }
-
-        output_file = output_dir / f"{pdf_file.stem}.json"
-        with open(output_file, "w", encoding="utf-8") as f:
-            json.dump(output_data, f, indent=2, ensure_ascii=False)
-
-        print(f"✅ Processed: {pdf_file.name} → {output_file.name}")
+    print("✅ All PDFs processed successfully.")
 
 if __name__ == "__main__":
-    print("🚀 Starting PDF processing...")
-    process_pdfs()
-    print("✅ All PDFs processed.")
+    main()
