@@ -1,6 +1,21 @@
 {
-  "title": "Overview  Foundation Level Extensions",
+  "title": "Foundation Level Extensions",
   "outline": [
+    {
+      "level": "H1",
+      "text": "Overview",
+      "page": 0
+    },
+    {
+      "level": "H1",
+      "text": "Foundation Level Extensions",
+      "page": 0
+    },
+    {
+      "level": "H2",
+      "text": "International Software Testing Qualifications Board",
+      "page": 0
+    },
     {
       "level": "H3",
       "text": "Revision History",
